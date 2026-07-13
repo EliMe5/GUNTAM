@@ -69,6 +69,18 @@ class PreprocessingConfig:
         # z0-based pair weight bin size: weight = int(|z0| / z0_weight_bin) + 1. 0 disables z0 weighting.
         self.z0_weight_bin = 0
 
+        # ---- v2 (parquet / edge-model) options ----
+        # Minimum spacepoints per particle for it to count as a truth particle
+        # (parquet input path only; the CSV path keeps min_hits_per_particle in
+        # Read_ACTS_Csv). Locked v2 value: 4.
+        self.min_sp_per_particle = 4
+        # Build layer-aware truth EDGES (consecutive occupied layers, bipartite,
+        # directed by increasing m) instead of all same-particle pairs.
+        # Requires 'layer_key' and 'm' columns (parquet input).
+        self.edge_truth = False
+        # Sort hits by m = (R + rho)/2 instead of r (requires 'm' column).
+        self.sort_by_m = False
+
         # Orphan target hit
         self.orphan_target = False
 
@@ -91,8 +103,8 @@ class PreprocessingConfig:
             "--input_format",
             type=str,
             default=self.input_format,
-            choices=["csv", "h5"],
-            help="Format of input files ('csv' or 'h5')",
+            choices=["csv", "h5", "parquet"],
+            help="Format of input files ('csv', 'h5', or 'parquet' chunk pairs)",
         )
         parser.add_argument(
             "--input_tensor_path",
@@ -233,6 +245,26 @@ class PreprocessingConfig:
             ),
         )
 
+        # v2 (parquet / edge-model) options
+        parser.add_argument(
+            "--min_sp_per_particle",
+            type=int,
+            default=self.min_sp_per_particle,
+            help="Minimum spacepoints per particle for truth (parquet input only)",
+        )
+        parser.add_argument(
+            "--edge_truth",
+            action=argparse.BooleanOptionalAction,
+            default=self.edge_truth,
+            help="Build layer-aware truth edges (consecutive occupied layers, directed by m)",
+        )
+        parser.add_argument(
+            "--sort_by_m",
+            action=argparse.BooleanOptionalAction,
+            default=self.sort_by_m,
+            help="Sort hits by m = (R + rho)/2 instead of r",
+        )
+
     def apply_args(self, args: argparse.Namespace) -> None:
         """
         Apply the values from a parsed Namespace to the configuration.
@@ -264,6 +296,9 @@ class PreprocessingConfig:
         self.pv_pair_weight = args.pv_pair_weight
         self.z0_weight_bin = args.z0_weight_bin
         self.orphan_target = args.orphan_target
+        self.min_sp_per_particle = args.min_sp_per_particle
+        self.edge_truth = args.edge_truth
+        self.sort_by_m = args.sort_by_m
 
         # Validate orphan_hit_fraction range
         if self.orphan_hit_fraction < 0.0 or self.orphan_hit_fraction > 1.0:

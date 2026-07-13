@@ -1,6 +1,79 @@
-from typing import Dict
+from typing import Dict, Tuple
 import torch
 import torch.nn.functional as F
+
+
+def edge_bce_loss(
+    edge_logits: torch.Tensor,  # [N, N] edge logits (-inf outside candidate mask)
+    candidate_mask: torch.Tensor,  # [N, N] bool, True = candidate edge
+    pairs1: torch.Tensor,  # [N_edges] source hit indices of truth edges (directed, low m -> high m)
+    pairs2: torch.Tensor,  # [N_edges] target hit indices of truth edges
+    target: torch.Tensor,  # [N_edges] edge weights (>0 real edge; 0 = padding row)
+) -> Tuple[torch.Tensor, Dict[str, int]]:
+    """
+    Per-edge binary cross-entropy over the candidate-edge set (GUNTAM v2).
+
+    Positives are the layer-aware truth edges (consecutive occupied layers,
+    directed by increasing m) that fall INSIDE the candidate mask; truth edges
+    outside the mask (killed by the in-graph cuts, ~0.1% of good edges for the
+    5 mm rule) are pruned from the loss entirely -- the head can never fire on
+    them, so training on them would only add noise. Negatives are all remaining
+    candidate edges. Classes are balanced (each side sums to ~1) and positive
+    weights are scaled by the per-edge weight (PV / z0 scheme).
+
+    Args:
+        edge_logits: `[N, N]` logits from the edge MLP head. Only entries where
+            candidate_mask is True are used, so the -inf fill never enters.
+        candidate_mask: `[N, N]` bool candidate mask from the model.
+        pairs1: `[N_edges]` truth edge source indices (directed; NOT symmetric).
+        pairs2: `[N_edges]` truth edge target indices.
+        target: `[N_edges]` weights; entries <= 0 are padding and ignored.
+
+    Returns:
+        Tuple of (scalar loss, stats dict) with stats keys:
+        n_pos (positives in loss), n_pos_pruned (truth edges outside the
+        candidate mask), n_neg (negative candidates).
+    """
+    device = edge_logits.device
+    stats = {"n_pos": 0, "n_pos_pruned": 0, "n_neg": 0}
+
+    pos_valid = target > 0
+    p1 = pairs1[pos_valid]
+    p2 = pairs2[pos_valid]
+    weights_pos = target[pos_valid].float()
+
+    if p1.numel() == 0 or not candidate_mask.any():
+        return torch.tensor(0.0, device=device), stats
+
+    # Prune truth edges that the in-graph cuts make impossible
+    inside = candidate_mask[p1, p2]
+    stats["n_pos_pruned"] = int((~inside).sum().item())
+    p1, p2, weights_pos = p1[inside], p2[inside], weights_pos[inside]
+    n_pos = p1.numel()
+    stats["n_pos"] = n_pos
+
+    # Positive-target matrix restricted to candidates. The loss itself always
+    # runs in float32 (stable under bf16/fp16 autocast on the logits).
+    target_matrix = torch.zeros_like(candidate_mask, dtype=torch.float32)
+    if n_pos > 0:
+        target_matrix[p1, p2] = 1.0
+    weight_matrix = torch.ones_like(candidate_mask, dtype=torch.float32)
+    if n_pos > 0:
+        weight_matrix[p1, p2] = weights_pos
+
+    logits = edge_logits[candidate_mask].float()
+    targets = target_matrix[candidate_mask]
+    pair_weights = weight_matrix[candidate_mask]
+
+    n_neg = int(candidate_mask.sum().item()) - n_pos
+    stats["n_neg"] = n_neg
+
+    pos_weight = 1.0 / max(n_pos, 1)
+    neg_weight = 1.0 / max(n_neg, 1)
+    weights = torch.where(targets > 0, pos_weight * pair_weights, torch.full_like(pair_weights, neg_weight))
+
+    loss = F.binary_cross_entropy_with_logits(logits, targets, weight=weights, reduction="sum")
+    return loss, stats
 
 
 def attention_loss(

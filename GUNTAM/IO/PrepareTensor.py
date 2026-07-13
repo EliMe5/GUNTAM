@@ -10,6 +10,7 @@ import torch
 
 from GUNTAM.Transformer.BinTensor import global_bin, neighbor_bin, no_bin, margin_bin
 from GUNTAM.IO.PreprocessingConfig import PreprocessingConfig
+from GUNTAM.IO.Read_Parquet import find_parquet_chunks, load_parquet_chunk
 
 import h5py
 
@@ -235,6 +236,131 @@ def _build_good_pairs_tensors(
                 pairs_tensor[event_idx, bin_id, : len(pairs), :] = torch.tensor(pairs, dtype=torch.long)
 
     return pairs_tensor
+
+
+def _build_truth_edge_tensors(
+    data_batch: pd.DataFrame,
+    bins: pd.DataFrame,
+    hit_to_particle: pd.Series,
+    num_bins: int,
+    pv_weight: int = 10,
+    particles_batch: pd.DataFrame | None = None,
+    z0_weight_bin: int = 0,
+) -> torch.Tensor:
+    """
+    Build the layer-aware truth EDGE tensor (v2 design).
+
+    For each particle inside a bin, its hits are grouped by detector layer
+    (``layer_key`` column), the occupied layers are ordered by mean m, and
+    consecutive occupied layers are connected bipartitely: every hit on layer
+    L to every hit on layer L+1. Two hits on the same layer are NEVER a truth
+    edge. Edges are DIRECTED from the lower-m layer to the higher-m layer,
+    matching the model's forward-only (m_i < m_j) candidate masking; the pair
+    list is therefore NOT symmetric, unlike _build_good_pairs_tensors.
+
+    Weights follow the same scheme as _build_good_pairs_tensors:
+    label = pv_weight for primary-vertex particles else 1, plus the optional
+    z0-bracket contribution (2**int(|z0|/z0_weight_bin) - 1).
+
+    Args:
+        data_batch: Hit DataFrame with 'event_id', 'layer_key', 'm' columns.
+        bins: DataFrame with 'bin0', 'bin1', 'bin2' columns aligned to data_batch.
+        hit_to_particle: Series mapping hits to particle ids (same index).
+        num_bins: Total number of bins.
+        pv_weight: Weight for primary-vertex particle edges.
+        particles_batch: Optional particles with 'event_id', 'particle_id', 'z0'.
+        z0_weight_bin: Bin size for z0-based weighting (0 disables).
+
+    Returns:
+        Tensor [num_events, num_bins, max_edges_per_bin, 3] of
+        (source_pos, target_pos, label) using bin-relative hit positions.
+    """
+    print("    Building layer-aware truth edge tensor...")
+
+    if "layer_key" not in data_batch.columns or "m" not in data_batch.columns:
+        raise ValueError("edge_truth requires 'layer_key' and 'm' hit columns (parquet input)")
+
+    z0_lookup: Dict[Tuple[int, int], int] = {}
+    if z0_weight_bin != 0 and particles_batch is not None and "z0" in particles_batch.columns:
+        for eid, pid, z0 in particles_batch[["event_id", "particle_id", "z0"]].to_numpy():
+            weight = int(abs(float(z0)) / z0_weight_bin)
+            z0_lookup[(int(eid), int(pid))] = 2**weight - 1
+
+    unique_events = data_batch["event_id"].unique()
+    unique_bins = bins["bin1"].unique()
+    bin_only = bins[["bin0", "bin1", "bin2"]]
+    global_bin_mask = []
+    for bin_id in range(max(unique_bins) + 1):
+        global_bin_mask.append(bin_only.eq(bin_id).any(axis=1))
+
+    all_edges: Dict[int, Dict[int, np.ndarray]] = {}
+    max_edges_per_bin = 0
+
+    for event_id in unique_events:
+        event_mask = data_batch["event_id"] == event_id
+        all_edges[event_id] = {}
+
+        for bin_id in range(max(unique_bins) + 1):
+            bin_mask = global_bin_mask[bin_id] & event_mask
+            bin_hits = data_batch[bin_mask]
+            bin_hit_indices = bin_hits.index.to_numpy()
+            bin_pids = hit_to_particle.loc[bin_hit_indices].to_numpy()
+            edges_list = []
+
+            if len(bin_hit_indices) > 0:
+                layer_keys = bin_hits["layer_key"].to_numpy()
+                m_vals = bin_hits["m"].to_numpy()
+                pv_flags = (
+                    bin_hits["particle_id_pv"].to_numpy() == 1
+                    if "particle_id_pv" in bin_hits.columns
+                    else np.zeros(len(bin_hits), dtype=bool)
+                )
+
+                for pid in np.unique(bin_pids):
+                    if pid < 0:  # orphan (-1), empty (-2)
+                        continue
+                    positions = np.where(bin_pids == pid)[0]
+                    if len(positions) < 2:
+                        continue
+
+                    # Group this particle's hits by layer, order layers by mean m
+                    layer_groups: Dict[int, list] = {}
+                    for pos in positions:
+                        layer_groups.setdefault(int(layer_keys[pos]), []).append(pos)
+                    if len(layer_groups) < 2:
+                        continue
+                    ordered_layers = sorted(
+                        layer_groups, key=lambda lk: float(np.mean(m_vals[layer_groups[lk]]))
+                    )
+
+                    # Edge weight for this particle
+                    label = pv_weight if pv_flags[positions[0]] else 1
+                    label += z0_lookup.get((int(event_id), int(pid)), 0)
+
+                    # Bipartite connections between consecutive occupied layers,
+                    # directed low-m layer -> high-m layer
+                    for l_lo, l_hi in zip(ordered_layers[:-1], ordered_layers[1:]):
+                        for a in layer_groups[l_lo]:
+                            for b in layer_groups[l_hi]:
+                                edges_list.append((a, b, label))
+
+            edges = (
+                np.asarray(edges_list, dtype=np.int64)
+                if edges_list
+                else np.empty((0, 3), dtype=np.int64)
+            )
+            all_edges[event_id][bin_id] = edges
+            max_edges_per_bin = max(max_edges_per_bin, len(edges))
+
+    num_events = len(unique_events)
+    edges_tensor = torch.zeros((num_events, num_bins, max(max_edges_per_bin, 1), 3), dtype=torch.long)
+    for event_idx, event_id in enumerate(sorted(unique_events)):
+        for bin_id in range(max(unique_bins) + 1):
+            edges = all_edges[event_id][bin_id]
+            if len(edges) > 0:
+                edges_tensor[event_idx, bin_id, : len(edges), :] = torch.tensor(edges, dtype=torch.long)
+
+    return edges_tensor
 
 
 def _to_tensor(
@@ -668,9 +794,14 @@ def _process_single_batch(args: Tuple) -> Tuple[str, Tuple[int, int], int, int]:
     # Perform binning and tensor preparation
     bins, nb_bins_max = _bin_data(data_batch, cfg)
 
-    # Sort hits by r before padding so that padding (r=0) is not sorted to the front
-    if "r" in data_batch.columns:
-        data_batch = data_batch.sort_values("r", ascending=True)
+    # Sort hits before padding so that padding (all-zeros) is not sorted to the front.
+    # v2: sort by m = (R + rho)/2 -- this ORDER DEFINES "forward" for the edge mask,
+    # the truth edges, and beam search; the inference-side seeder must sort identically.
+    sort_col = "m" if (cfg.sort_by_m and "m" in data_batch.columns) else "r"
+    if cfg.sort_by_m and "m" not in data_batch.columns:
+        raise ValueError("sort_by_m=True but no 'm' column in input data")
+    if sort_col in data_batch.columns:
+        data_batch = data_batch.sort_values(sort_col, ascending=True, kind="stable")
         bins = bins.loc[data_batch.index].reset_index(drop=True)
         data_batch = data_batch.reset_index(drop=True)
 
@@ -693,8 +824,10 @@ def _process_single_batch(args: Tuple) -> Tuple[str, Tuple[int, int], int, int]:
     # Create the padding mask tensor for this batch (after empty hits are inserted)
     data_batch, padding_mask = _create_padding_mask(data_batch, bins, nb_bins_max, cfg)
 
-    # Create the good pairs tensor for this batch
-    good_pairs = _build_good_pairs_tensors(
+    # Create the truth pair/edge tensor for this batch.
+    # v2 edge_truth: layer-aware directed edges; legacy: all same-particle pairs.
+    pair_builder = _build_truth_edge_tensors if cfg.edge_truth else _build_good_pairs_tensors
+    good_pairs = pair_builder(
         data_batch,
         bins,
         hit_to_particle,
@@ -768,6 +901,12 @@ def compute_barcode(cfg: PreprocessingConfig) -> str:
         barcode += f"_OF{int(cfg.orphan_hit_fraction * 100)}"
     if cfg.max_events > 0:
         barcode += f"_NE{cfg.max_events}"
+    if getattr(cfg, "edge_truth", False):
+        barcode += "_ET"
+    if getattr(cfg, "sort_by_m", False):
+        barcode += "_SM"
+    if getattr(cfg, "input_format", "csv") == "parquet":
+        barcode += f"_MS{int(cfg.min_sp_per_particle)}"
     return barcode
 
 
@@ -865,8 +1004,12 @@ def prepare_tensor(
             print(f"Found {len(hits_files)} hits CSV file(s)")
         else:
             raise FileNotFoundError(f"No space_points_small*.csv or hits_small*.csv files found in {input_path}")
+    elif input_format == "parquet":
+        data_files = find_parquet_chunks(input_path)  # type: ignore[assignment]
+        data_type = "space_points"
+        print(f"Found {len(data_files)} parquet chunk pair(s)")
     else:
-        raise ValueError(f"Unsupported input format: {input_format}. Use 'h5' or 'csv'")
+        raise ValueError(f"Unsupported input format: {input_format}. Use 'h5', 'csv' or 'parquet'")
 
     file_id = 0
     tot_event = 0
@@ -903,6 +1046,19 @@ def prepare_tensor(
             data = pd.read_csv(data_csv_file)  # type: ignore[has-type]
             particles = pd.read_csv(particles_csv_file)  # type: ignore[has-type]
             print(f"  Loaded {data_type} data from {data_csv_file}")  # type: ignore[has-type]
+
+        elif input_format == "parquet":
+            sp_file, particle_file = data_file  # type: ignore[misc,str-unpack]
+            data, particles = load_parquet_chunk(sp_file, particle_file, cfg.min_sp_per_particle)
+            # Densify true ACTS event numbers to local 0..n-1 ids (the batching
+            # below slices event_id ranges); keep provenance in 'event_number'.
+            uniq = sorted(data["event_id"].unique())
+            id_map = {int(e): i for i, e in enumerate(uniq)}
+            data["event_number"] = data["event_id"]
+            particles["event_number"] = particles["event_id"]
+            data["event_id"] = data["event_id"].map(id_map)
+            particles["event_id"] = particles["event_id"].map(id_map)
+            print(f"  Loaded parquet chunk {sp_file} ({len(uniq)} events)")
 
         # Check if the number of events in data is divisible by the events_per_file
         num_events = len(data["event_id"].unique())
